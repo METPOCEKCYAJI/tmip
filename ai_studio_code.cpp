@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cwchar>
 #include <cwctype>
 #include <memory>
 #include <mutex>
@@ -185,268 +184,11 @@ namespace
         return buf;
     }
 
-    void TrimSpaceAndPunct(std::wstring& s)
-    {
-        while (!s.empty() && (s.back() == L' ' || s.back() == L'\t' || s.back() == L',' || s.back() == L';'))
-            s.pop_back();
-        while (!s.empty() && (s.front() == L' ' || s.front() == L'\t' || s.front() == L',' || s.front() == L';'))
-            s.erase(s.begin());
-    }
-
-    std::wstring StripLegalSuffixes(const std::wstring& raw)
-    {
-        std::wstring s = raw;
-        TrimSpaceAndPunct(s);
-        if (s.empty())
-            return raw;
-
-        static const wchar_t* const kPrefixes[] = {
-            L"Public Joint Stock Company ",
-            L"Joint Stock Company ",
-            L"PJSC ",
-            L"OJSC ",
-            L"CJSC ",
-            L"JSC ",
-            L"ПАО ",
-            L"ООО ",
-            L"ОАО ",
-            L"ЗАО ",
-            L"АО ",
-            L"ФГУП ",
-            L"ГУП "
-        };
-
-        for (const wchar_t* pref : kPrefixes)
-        {
-            int pLen = static_cast<int>(wcslen(pref));
-            if (static_cast<int>(s.size()) > pLen &&
-                CompareStringOrdinal(s.c_str(), pLen, pref, pLen, TRUE) == CSTR_EQUAL)
-            {
-                s.erase(0, pLen);
-                TrimSpaceAndPunct(s);
-                break;
-            }
-        }
-
-        if (s.size() >= 2 &&
-            ((s.front() == L'«' && s.back() == L'»') ||
-             (s.front() == L'"' && s.back() == L'"')))
-        {
-            s = s.substr(1, s.size() - 2);
-            TrimSpaceAndPunct(s);
-        }
-
-        static const wchar_t* const kSuffixes[] = {
-            L"GmbH & Co. KG", L"GmbH & Co KG", L"Co. KG",
-            L"Sp. z o.o.", L"s.r.o.", L"d.o.o.", L"o.o.d.",
-            L"S.à r.l.", L"S.a.r.l.", L"SARL",
-            L"Pty Ltd", L"Pte Ltd", L"Co., Ltd.", L"Co., Ltd", L"Co. Ltd.", L"Co. Ltd",
-            L"L.L.C.", L"L.L.C", L"S.r.l.", L"S.R.L.", L"S.p.A.", L"SpA",
-            L"Incorporated", L"Limited.", L"Limited",
-            L"GmbH", L"mbH", L"KGaA", L"Inc.", L"Inc", L"LLC", L"Ltd.", L"Ltd",
-            L"Corp.", L"Corp", L"PLC", L"Plc", L"S.A.", L"S.A", L"SA",
-            L"S.L.", L"S.L", L"B.V.", L"B.V", L"BV", L"N.V.", L"NV", L"K.K.",
-            L"Co.", L"AG", L"AB", L"AS", L"A/S", L"ApS", L"Oy", L"OY",
-            L"KG", L"OHG", L"e.V.", L"UG",
-            L"PJSC", L"OJSC", L"CJSC", L"JSC",
-            L"ПАО", L"ООО", L"ОАО", L"ЗАО", L"АО"
-        };
-
-        bool removed = true;
-        while (removed)
-        {
-            removed = false;
-            TrimSpaceAndPunct(s);
-            for (const wchar_t* suf : kSuffixes)
-            {
-                int sufLen = static_cast<int>(wcslen(suf));
-                if (static_cast<int>(s.size()) > sufLen)
-                {
-                    size_t startPos = s.size() - sufLen;
-                    wchar_t prev = s[startPos - 1];
-                    if ((prev == L' ' || prev == L',' || prev == L'.' || prev == L'\t') &&
-                        CompareStringOrdinal(s.c_str() + startPos, sufLen, suf, sufLen, TRUE) == CSTR_EQUAL)
-                    {
-                        s.erase(startPos);
-                        TrimSpaceAndPunct(s);
-                        removed = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (s.size() >= 2 &&
-            ((s.front() == L'«' && s.back() == L'»') ||
-             (s.front() == L'"' && s.back() == L'"')))
-        {
-            s = s.substr(1, s.size() - 2);
-            TrimSpaceAndPunct(s);
-        }
-
-        return s.empty() ? raw : s;
-    }
-
-    bool IsWordChar(wchar_t c)
-    {
-        return iswalnum(static_cast<wint_t>(c)) != 0;
-    }
-
-    std::wstring AbbreviateProviderWords(const std::wstring& input)
-    {
-        struct WordRule
-        {
-            const wchar_t* full;
-            const wchar_t* abbr;
-        };
-
-        static const WordRule kRules[] = {
-            // Английские и европейские
-            { L"International",      L"Intl" },
-            { L"Telecommunications", L"Telecom" },
-            { L"Telecommunication",  L"Telecom" },
-            { L"Communications",     L"Comm" },
-            { L"Communication",      L"Comm" },
-            { L"Technologies",       L"Tech" },
-            { L"Technology",         L"Tech" },
-            { L"Infrastructure",     L"Infra" },
-            { L"Information",        L"Info" },
-            { L"Corporation",        L"Corp" },
-            { L"Incorporated",       L"Inc" },
-            { L"Connectivity",       L"Conn" },
-            { L"Management",         L"Mgmt" },
-            { L"Development",        L"Dev" },
-            { L"Enterprises",        L"Ent" },
-            { L"Enterprise",         L"Ent" },
-            { L"Solutions",          L"Sol" },
-            { L"Solution",           L"Sol" },
-            { L"Services",           L"Svc" },
-            { L"Service",            L"Svc" },
-            { L"Networks",           L"Net" },
-            { L"Network",            L"Net" },
-            { L"Systems",            L"Sys" },
-            { L"System",             L"Sys" },
-            { L"Holdings",           L"Hldgs" },
-            { L"Company",            L"Co" },
-            { L"Group",              L"Grp" },
-            { L"Limited",            L"Ltd" },
-            { L"Deutschland",        L"DE" },
-            { L"Netherlands",        L"NL" },
-            { L"Switzerland",        L"CH" },
-            { L"Singapore",          L"SG" },
-            // Русские
-            { L"Телекоммуникационная", L"Телеком" },
-            { L"Телекоммуникации",     L"Телеком" },
-            { L"Международная",        L"Межд." },
-            { L"Международный",        L"Межд." },
-            { L"Информационные",       L"Информ." },
-            { L"Коммуникации",         L"Комм." },
-            { L"Технологии",           L"Тех" },
-            { L"Корпорация",           L"Корп." },
-            { L"Компания",             L"Комп." },
-            { L"Системы",              L"Сист." },
-            { L"Сервисы",              L"Серв." }
-        };
-
-        // Фразовые замены стран перед пословной заменой
-        std::wstring src = input;
-        struct PhraseRule { const wchar_t* full; const wchar_t* abbr; };
-        static const PhraseRule kPhrases[] = {
-            { L"United Kingdom", L"UK" },
-            { L"United States",  L"US" },
-            { L"Hong Kong",      L"HK" }
-        };
-        for (const auto& p : kPhrases)
-        {
-            int pLen = static_cast<int>(wcslen(p.full));
-            for (size_t pos = 0; pos + pLen <= src.size(); ++pos)
-            {
-                bool leftOk = (pos == 0) || !IsWordChar(src[pos - 1]);
-                bool rightOk = (pos + pLen == src.size()) || !IsWordChar(src[pos + pLen]);
-                if (leftOk && rightOk &&
-                    CompareStringOrdinal(src.c_str() + pos, pLen, p.full, pLen, TRUE) == CSTR_EQUAL)
-                {
-                    src.replace(pos, pLen, p.abbr);
-                }
-            }
-        }
-
-        std::wstring out;
-        out.reserve(src.size());
-        size_t i = 0;
-        while (i < src.size())
-        {
-            if (!IsWordChar(src[i]))
-            {
-                out.push_back(src[i++]);
-                continue;
-            }
-            size_t j = i;
-            while (j < src.size() && IsWordChar(src[j]))
-                ++j;
-            int wLen = static_cast<int>(j - i);
-            const wchar_t* replacement = nullptr;
-            for (const auto& r : kRules)
-            {
-                int rLen = static_cast<int>(wcslen(r.full));
-                if (wLen == rLen &&
-                    CompareStringOrdinal(src.c_str() + i, wLen, r.full, rLen, TRUE) == CSTR_EQUAL)
-                {
-                    replacement = r.abbr;
-                    break;
-                }
-            }
-            if (replacement)
-                out.append(replacement);
-            else
-                out.append(src, i, j - i);
-            i = j;
-        }
-        return out;
-    }
-
     int MeasureTextWidth(HDC hdc, const std::wstring& s)
     {
         RECT rc{ 0, 0, 0, 0 };
         DrawTextW(hdc, s.c_str(), -1, &rc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
         return rc.right - rc.left;
-    }
-
-    std::wstring FitProviderToWidth(HDC hdc, const std::wstring& rawText, int maxWidth, int& outMeasuredWidth)
-    {
-        std::wstring cand1 = rawText;
-        TrimSpaceAndPunct(cand1);
-        if (cand1.empty())
-            cand1 = L"—";
-
-        int w1 = MeasureTextWidth(hdc, cand1);
-        if (w1 <= maxWidth)
-        {
-            outMeasuredWidth = w1;
-            return cand1;
-        }
-
-        std::wstring cand2 = StripLegalSuffixes(cand1);
-        if (cand2 != cand1)
-        {
-            int w2 = MeasureTextWidth(hdc, cand2);
-            if (w2 <= maxWidth)
-            {
-                outMeasuredWidth = w2;
-                return cand2;
-            }
-        }
-
-        std::wstring cand3 = AbbreviateProviderWords(cand2);
-        int w3 = (cand3 != cand2) ? MeasureTextWidth(hdc, cand3) : MeasureTextWidth(hdc, cand2);
-        if (cand3 != cand2)
-        {
-            outMeasuredWidth = w3;
-            return cand3;
-        }
-
-        outMeasuredWidth = (cand2 != cand1) ? MeasureTextWidth(hdc, cand2) : w1;
-        return (cand2 != cand1) ? cand2 : cand1;
     }
 
     HFONT CreateCompactFont(HDC hdc, int targetPixelHeight)
@@ -582,7 +324,7 @@ public:
         case TMI_DESCRIPTION: return L"Отображает внешний IP, цветной флаг страны, город и провайдера на русском языке. Мигает 10 сек при смене сети.";
         case TMI_AUTHOR:      return L"Custom RU Plugin";
         case TMI_COPYRIGHT:   return L"MIT";
-        case TMI_VERSION:     return L"1.3.0";
+        case TMI_VERSION:     return L"1.3.1";
         case TMI_URL:         return L"https://github.com/zhongyang219/TrafficMonitorPlugins";
         default:              return L"";
         }
@@ -1179,7 +921,7 @@ void CIpDisplayItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_m
     else if (m_mode == Mode::TwoLineFlagIpIsp)
     {
         std::wstring topText = d.ip;
-        std::wstring rawBot = BuildRawProviderLine(d);
+        std::wstring botText = BuildRawProviderLine(d);
 
         int topH = h / 2;
         int botH = h - topH;
@@ -1215,17 +957,12 @@ void CIpDisplayItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_m
             DeleteObject(topFont);
         }
 
-        // Нижняя строка: адаптивная подгонка + центрирование, если короче ширины верхней строки
+        // Нижняя строка: оригинальное название (по центру если короче, с "..." если длиннее)
         HFONT botFont = CreateCompactFont(hdc, botFontPx);
         oldFont = botFont ? static_cast<HFONT>(SelectObject(hdc, botFont)) : nullptr;
 
         int availBotW = std::max(10, w - 4);
-        int botMeasuredW = 0;
-        std::wstring botText = d.valid
-            ? FitProviderToWidth(hdc, rawBot, availBotW, botMeasuredW)
-            : rawBot;
-        if (!d.valid)
-            botMeasuredW = MeasureTextWidth(hdc, botText);
+        int botMeasuredW = MeasureTextWidth(hdc, botText);
 
         if (botMeasuredW <= availBotW)
         {
@@ -1247,6 +984,9 @@ void CIpDisplayItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_m
     else
     {
         std::wstring text = BuildDisplayText();
+        int textW = MeasureTextWidth(hdc, text);
+        (void)textW;
+
         int flagH = std::min(std::max(8, h - 4), MulDiv(12, dpiY, 96));
         int flagW = (flagH * 3) / 2;
         int gap = MulDiv(4, dpiY, 96);
