@@ -261,7 +261,7 @@ public:
         return inst;
     }
 
-    ~CIPLocationPlugin() override
+    ~CIPLocationPlugin()
     {
         m_stopping = true;
         if (m_worker.joinable())
