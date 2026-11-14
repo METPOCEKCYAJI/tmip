@@ -117,7 +117,7 @@ namespace
     bool HttpGet(const wchar_t* host, INTERNET_PORT port, const wchar_t* path, bool useHttps, std::vector<uint8_t>& outBody)
     {
         outBody.clear();
-        HINTERNET hSession = WinHttpOpen(L"TrafficMonitor-IPLocationRU/1.2",
+        HINTERNET hSession = WinHttpOpen(L"TrafficMonitor-IPLocationRU/1.3",
                                          WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                          WINHTTP_NO_PROXY_NAME,
                                          WINHTTP_NO_PROXY_BYPASS, 0);
@@ -193,7 +193,7 @@ namespace
             s.erase(s.begin());
     }
 
-    std::wstring CleanProviderName(const std::wstring& raw)
+    std::wstring StripLegalSuffixes(const std::wstring& raw)
     {
         std::wstring s = raw;
         TrimSpaceAndPunct(s);
@@ -237,13 +237,17 @@ namespace
         }
 
         static const wchar_t* const kSuffixes[] = {
+            L"GmbH & Co. KG", L"GmbH & Co KG", L"Co. KG",
             L"Sp. z o.o.", L"s.r.o.", L"d.o.o.", L"o.o.d.",
+            L"S.à r.l.", L"S.a.r.l.", L"SARL",
             L"Pty Ltd", L"Pte Ltd", L"Co., Ltd.", L"Co., Ltd", L"Co. Ltd.", L"Co. Ltd",
-            L"L.L.C.", L"L.L.C", L"S.r.l.", L"S.R.L.",
+            L"L.L.C.", L"L.L.C", L"S.r.l.", L"S.R.L.", L"S.p.A.", L"SpA",
+            L"Incorporated", L"Limited.", L"Limited",
             L"GmbH", L"mbH", L"KGaA", L"Inc.", L"Inc", L"LLC", L"Ltd.", L"Ltd",
             L"Corp.", L"Corp", L"PLC", L"Plc", L"S.A.", L"S.A", L"SA",
-            L"S.L.", L"S.L", L"B.V.", L"B.V", L"BV", L"N.V.", L"K.K.",
-            L"Co.", L"AG", L"AB", L"A/S", L"KG", L"OHG", L"e.V.", L"UG",
+            L"S.L.", L"S.L", L"B.V.", L"B.V", L"BV", L"N.V.", L"NV", L"K.K.",
+            L"Co.", L"AG", L"AB", L"AS", L"A/S", L"ApS", L"Oy", L"OY",
+            L"KG", L"OHG", L"e.V.", L"UG",
             L"PJSC", L"OJSC", L"CJSC", L"JSC",
             L"ПАО", L"ООО", L"ОАО", L"ЗАО", L"АО"
         };
@@ -281,6 +285,168 @@ namespace
         }
 
         return s.empty() ? raw : s;
+    }
+
+    bool IsWordChar(wchar_t c)
+    {
+        return iswalnum(static_cast<wint_t>(c)) != 0;
+    }
+
+    std::wstring AbbreviateProviderWords(const std::wstring& input)
+    {
+        struct WordRule
+        {
+            const wchar_t* full;
+            const wchar_t* abbr;
+        };
+
+        static const WordRule kRules[] = {
+            // Английские и европейские
+            { L"International",      L"Intl" },
+            { L"Telecommunications", L"Telecom" },
+            { L"Telecommunication",  L"Telecom" },
+            { L"Communications",     L"Comm" },
+            { L"Communication",      L"Comm" },
+            { L"Technologies",       L"Tech" },
+            { L"Technology",         L"Tech" },
+            { L"Infrastructure",     L"Infra" },
+            { L"Information",        L"Info" },
+            { L"Corporation",        L"Corp" },
+            { L"Incorporated",       L"Inc" },
+            { L"Connectivity",       L"Conn" },
+            { L"Management",         L"Mgmt" },
+            { L"Development",        L"Dev" },
+            { L"Enterprises",        L"Ent" },
+            { L"Enterprise",         L"Ent" },
+            { L"Solutions",          L"Sol" },
+            { L"Solution",           L"Sol" },
+            { L"Services",           L"Svc" },
+            { L"Service",            L"Svc" },
+            { L"Networks",           L"Net" },
+            { L"Network",            L"Net" },
+            { L"Systems",            L"Sys" },
+            { L"System",             L"Sys" },
+            { L"Holdings",           L"Hldgs" },
+            { L"Company",            L"Co" },
+            { L"Group",              L"Grp" },
+            { L"Limited",            L"Ltd" },
+            { L"Deutschland",        L"DE" },
+            { L"Netherlands",        L"NL" },
+            { L"Switzerland",        L"CH" },
+            { L"Singapore",          L"SG" },
+            // Русские
+            { L"Телекоммуникационная", L"Телеком" },
+            { L"Телекоммуникации",     L"Телеком" },
+            { L"Международная",        L"Межд." },
+            { L"Международный",        L"Межд." },
+            { L"Информационные",       L"Информ." },
+            { L"Коммуникации",         L"Комм." },
+            { L"Технологии",           L"Тех" },
+            { L"Корпорация",           L"Корп." },
+            { L"Компания",             L"Комп." },
+            { L"Системы",              L"Сист." },
+            { L"Сервисы",              L"Серв." }
+        };
+
+        // Фразовые замены стран перед пословной заменой
+        std::wstring src = input;
+        struct PhraseRule { const wchar_t* full; const wchar_t* abbr; };
+        static const PhraseRule kPhrases[] = {
+            { L"United Kingdom", L"UK" },
+            { L"United States",  L"US" },
+            { L"Hong Kong",      L"HK" }
+        };
+        for (const auto& p : kPhrases)
+        {
+            int pLen = static_cast<int>(wcslen(p.full));
+            for (size_t pos = 0; pos + pLen <= src.size(); ++pos)
+            {
+                bool leftOk = (pos == 0) || !IsWordChar(src[pos - 1]);
+                bool rightOk = (pos + pLen == src.size()) || !IsWordChar(src[pos + pLen]);
+                if (leftOk && rightOk &&
+                    CompareStringOrdinal(src.c_str() + pos, pLen, p.full, pLen, TRUE) == CSTR_EQUAL)
+                {
+                    src.replace(pos, pLen, p.abbr);
+                }
+            }
+        }
+
+        std::wstring out;
+        out.reserve(src.size());
+        size_t i = 0;
+        while (i < src.size())
+        {
+            if (!IsWordChar(src[i]))
+            {
+                out.push_back(src[i++]);
+                continue;
+            }
+            size_t j = i;
+            while (j < src.size() && IsWordChar(src[j]))
+                ++j;
+            int wLen = static_cast<int>(j - i);
+            const wchar_t* replacement = nullptr;
+            for (const auto& r : kRules)
+            {
+                int rLen = static_cast<int>(wcslen(r.full));
+                if (wLen == rLen &&
+                    CompareStringOrdinal(src.c_str() + i, wLen, r.full, rLen, TRUE) == CSTR_EQUAL)
+                {
+                    replacement = r.abbr;
+                    break;
+                }
+            }
+            if (replacement)
+                out.append(replacement);
+            else
+                out.append(src, i, j - i);
+            i = j;
+        }
+        return out;
+    }
+
+    int MeasureTextWidth(HDC hdc, const std::wstring& s)
+    {
+        RECT rc{ 0, 0, 0, 0 };
+        DrawTextW(hdc, s.c_str(), -1, &rc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        return rc.right - rc.left;
+    }
+
+    std::wstring FitProviderToWidth(HDC hdc, const std::wstring& rawText, int maxWidth, int& outMeasuredWidth)
+    {
+        std::wstring cand1 = rawText;
+        TrimSpaceAndPunct(cand1);
+        if (cand1.empty())
+            cand1 = L"—";
+
+        int w1 = MeasureTextWidth(hdc, cand1);
+        if (w1 <= maxWidth)
+        {
+            outMeasuredWidth = w1;
+            return cand1;
+        }
+
+        std::wstring cand2 = StripLegalSuffixes(cand1);
+        if (cand2 != cand1)
+        {
+            int w2 = MeasureTextWidth(hdc, cand2);
+            if (w2 <= maxWidth)
+            {
+                outMeasuredWidth = w2;
+                return cand2;
+            }
+        }
+
+        std::wstring cand3 = AbbreviateProviderWords(cand2);
+        int w3 = (cand3 != cand2) ? MeasureTextWidth(hdc, cand3) : MeasureTextWidth(hdc, cand2);
+        if (cand3 != cand2)
+        {
+            outMeasuredWidth = w3;
+            return cand3;
+        }
+
+        outMeasuredWidth = (cand2 != cand1) ? MeasureTextWidth(hdc, cand2) : w1;
+        return (cand2 != cand1) ? cand2 : cand1;
     }
 
     HFONT CreateCompactFont(HDC hdc, int targetPixelHeight)
@@ -356,7 +522,7 @@ public:
 
 private:
     std::wstring BuildDisplayText() const;
-    std::wstring BuildProviderLine(const IpGeoData& d) const;
+    std::wstring BuildRawProviderLine(const IpGeoData& d) const;
 
     CIPLocationPlugin& m_owner;
     Mode m_mode;
@@ -416,7 +582,7 @@ public:
         case TMI_DESCRIPTION: return L"Отображает внешний IP, цветной флаг страны, город и провайдера на русском языке. Мигает 10 сек при смене сети.";
         case TMI_AUTHOR:      return L"Custom RU Plugin";
         case TMI_COPYRIGHT:   return L"MIT";
-        case TMI_VERSION:     return L"1.2.1";
+        case TMI_VERSION:     return L"1.3.0";
         case TMI_URL:         return L"https://github.com/zhongyang219/TrafficMonitorPlugins";
         default:              return L"";
         }
@@ -816,14 +982,14 @@ const wchar_t* CIpDisplayItem::GetItemId() const
     }
 }
 
-std::wstring CIpDisplayItem::BuildProviderLine(const IpGeoData& d) const
+std::wstring CIpDisplayItem::BuildRawProviderLine(const IpGeoData& d) const
 {
     if (!d.valid)
         return (d.ip == L"Загрузка...") ? L"Подключение..." : L"Нет подключения";
     if (!d.isp.empty())
-        return CleanProviderName(d.isp);
+        return d.isp;
     if (!d.org.empty())
-        return CleanProviderName(d.org);
+        return d.org;
     if (!d.country.empty())
         return d.country;
     return L"—";
@@ -851,7 +1017,7 @@ std::wstring CIpDisplayItem::BuildDisplayText() const
             return (d.ip == L"Загрузка...") ? L"..." : L"--";
         return !d.countryCode.empty() ? d.countryCode : L"--";
     case Mode::TwoLineFlagIpIsp:
-        return d.ip + L" / " + BuildProviderLine(d);
+        return d.ip + L" / " + BuildRawProviderLine(d);
     default:
         return d.ip;
     }
@@ -904,9 +1070,7 @@ int CIpDisplayItem::GetItemWidthEx(void* hDC) const
         HFONT compactFont = CreateCompactFont(hdc, MulDiv(10, dpiY, 96));
         HFONT oldFont = compactFont ? static_cast<HFONT>(SelectObject(hdc, compactFont)) : nullptr;
 
-        RECT rc{ 0, 0, 0, 0 };
-        DrawTextW(hdc, text.c_str(), -1, &rc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-        int textW = rc.right - rc.left;
+        int textW = MeasureTextWidth(hdc, text);
 
         if (compactFont)
         {
@@ -919,15 +1083,12 @@ int CIpDisplayItem::GetItemWidthEx(void* hDC) const
 
     if (m_mode == Mode::TwoLineFlagIpIsp)
     {
-        // Ширина всего 2-строчного блока строго определяется длиной "Флаг + IP"
         std::wstring topText = d.ip;
 
         HFONT lineFont = CreateCompactFont(hdc, MulDiv(12, dpiY, 96));
         HFONT oldFont = lineFont ? static_cast<HFONT>(SelectObject(hdc, lineFont)) : nullptr;
 
-        RECT rcTop{ 0, 0, 0, 0 };
-        DrawTextW(hdc, topText.c_str(), -1, &rcTop, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-        int topW = rcTop.right - rcTop.left;
+        int topW = MeasureTextWidth(hdc, topText);
 
         if (lineFont)
         {
@@ -945,9 +1106,7 @@ int CIpDisplayItem::GetItemWidthEx(void* hDC) const
     }
 
     std::wstring text = BuildDisplayText();
-    RECT rc{ 0, 0, 0, 0 };
-    DrawTextW(hdc, text.c_str(), -1, &rc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
-    int textW = rc.right - rc.left;
+    int textW = MeasureTextWidth(hdc, text);
 
     int flagH = MulDiv(12, dpiY, 96);
     int flagW = (flagH * 3) / 2;
@@ -1020,7 +1179,7 @@ void CIpDisplayItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_m
     else if (m_mode == Mode::TwoLineFlagIpIsp)
     {
         std::wstring topText = d.ip;
-        std::wstring botText = BuildProviderLine(d);
+        std::wstring rawBot = BuildRawProviderLine(d);
 
         int topH = h / 2;
         int botH = h - topH;
@@ -1028,23 +1187,26 @@ void CIpDisplayItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_m
         int topFontPx = std::min(MulDiv(12, dpiY, 96), std::max(8, topH - 2));
         int botFontPx = std::min({ MulDiv(10, dpiY, 96), std::max(7, botH - 2), std::max(7, topFontPx - 1) });
 
-        // Верхняя строка: Флаг + IP
+        // Верхняя строка: Флаг + IP (центрируется в выделенной ширине w)
         HFONT topFont = CreateCompactFont(hdc, topFontPx);
         HFONT oldFont = topFont ? static_cast<HFONT>(SelectObject(hdc, topFont)) : nullptr;
 
+        bool hasFlag = !d.flagPng.empty();
         int flagH = std::min(std::max(7, topH - 3), MulDiv(11, dpiY, 96));
         int flagW = (flagH * 3) / 2;
         int gap = MulDiv(4, dpiY, 96);
-        int topX = x + 1;
+        int topTextW = MeasureTextWidth(hdc, topText);
+        int topContentW = (hasFlag ? (flagW + gap) : 0) + topTextW;
+        int topX = (topContentW <= w - 2) ? (x + (w - topContentW) / 2) : (x + 2);
 
-        if (!d.flagPng.empty())
+        if (hasFlag)
         {
             int flagY = y + std::max(0, (topH - flagH) / 2);
             m_owner.EnsureGdiplusAndDrawFlag(hdc, topX, flagY, flagW, flagH, d.flagPng, d.flagGeneration);
             topX += flagW + gap;
         }
 
-        RECT topRc{ topX, y, x + w, y + topH };
+        RECT topRc{ topX, y, x + w - 1, y + topH };
         DrawTextW(hdc, topText.c_str(), -1, &topRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
         if (topFont)
@@ -1053,12 +1215,28 @@ void CIpDisplayItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_m
             DeleteObject(topFont);
         }
 
-        // Нижняя строка: Провайдер (чуть мельче, ровно в ширину верхнего блока)
+        // Нижняя строка: адаптивная подгонка + центрирование, если короче ширины верхней строки
         HFONT botFont = CreateCompactFont(hdc, botFontPx);
         oldFont = botFont ? static_cast<HFONT>(SelectObject(hdc, botFont)) : nullptr;
 
-        RECT botRc{ x + 1, y + topH, x + w, y + h };
-        DrawTextW(hdc, botText.c_str(), -1, &botRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        int availBotW = std::max(10, w - 4);
+        int botMeasuredW = 0;
+        std::wstring botText = d.valid
+            ? FitProviderToWidth(hdc, rawBot, availBotW, botMeasuredW)
+            : rawBot;
+        if (!d.valid)
+            botMeasuredW = MeasureTextWidth(hdc, botText);
+
+        if (botMeasuredW <= availBotW)
+        {
+            RECT botRc{ x + 1, y + topH, x + w - 1, y + h };
+            DrawTextW(hdc, botText.c_str(), -1, &botRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        else
+        {
+            RECT botRc{ x + 2, y + topH, x + w - 1, y + h };
+            DrawTextW(hdc, botText.c_str(), -1, &botRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
 
         if (botFont)
         {
