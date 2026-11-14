@@ -117,14 +117,14 @@ namespace
     bool HttpGet(const wchar_t* host, INTERNET_PORT port, const wchar_t* path, bool useHttps, std::vector<uint8_t>& outBody)
     {
         outBody.clear();
-        HINTERNET hSession = WinHttpOpen(L"TrafficMonitor-IPLocationRU/1.0",
+        HINTERNET hSession = WinHttpOpen(L"TrafficMonitor-IPLocationRU/1.2",
                                          WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                          WINHTTP_NO_PROXY_NAME,
                                          WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession)
             return false;
 
-        WinHttpSetTimeouts(hSession, 4000, 4000, 4000, 5000);
+        WinHttpSetTimeouts(hSession, 2500, 2500, 2500, 3000);
 
         HINTERNET hConnect = WinHttpConnect(hSession, host, port, 0);
         if (!hConnect)
@@ -200,12 +200,23 @@ namespace
                            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     }
+
+    void InvalidateThreadWindows(DWORD tid)
+    {
+        if (tid == 0)
+            return;
+        EnumThreadWindows(tid, [](HWND hwnd, LPARAM) -> BOOL {
+            if (IsWindowVisible(hwnd))
+                InvalidateRect(hwnd, nullptr, FALSE);
+            return TRUE;
+        }, 0);
+    }
 }
 
 struct IpGeoData
 {
     bool valid = false;
-    std::wstring ip = L"Нет сети";
+    std::wstring ip = L"Загрузка...";
     std::wstring country = L"Неизвестно";
     std::wstring countryCode;
     std::wstring region;
@@ -228,7 +239,8 @@ public:
         FlagAndIp,
         FlagAndLocation,
         FlagCodeAndIp,
-        FlagAboveCode
+        FlagAboveCode,
+        TwoLineFlagIpIsp
     };
 
     CIpDisplayItem(CIPLocationPlugin& owner, Mode mode)
@@ -246,6 +258,7 @@ public:
 
 private:
     std::wstring BuildDisplayText() const;
+    std::wstring BuildProviderLine(const IpGeoData& d) const;
 
     CIPLocationPlugin& m_owner;
     Mode m_mode;
@@ -265,7 +278,9 @@ public:
     {
         m_stopping = true;
         if (m_worker.joinable())
-            m_worker.join();
+            m_worker.detach();
+        if (m_blinkThread.joinable())
+            m_blinkThread.detach();
     }
 
     IPluginItem* GetItem(int index) override
@@ -276,14 +291,16 @@ public:
         case 1: return &m_itemLoc;
         case 2: return &m_itemCodeIp;
         case 3: return &m_itemMini;
+        case 4: return &m_itemTwoLine;
         default: return nullptr;
         }
     }
 
     void DataRequired() override
     {
+        RecordUiThread();
         ULONGLONG now = GetTickCount64();
-        if (!m_fetching.load() && (m_lastFetchMs == 0 || now - m_lastFetchMs >= 30000))
+        if (!m_fetching.load() && (m_lastFetchMs == 0 || now - m_lastFetchMs >= 6000))
         {
             if (m_worker.joinable())
                 m_worker.join();
@@ -298,10 +315,10 @@ public:
         switch (index)
         {
         case TMI_NAME:        return L"IP и Геолокация (RU)";
-        case TMI_DESCRIPTION: return L"Отображает внешний IP, цветной флаг страны, город и провайдера на русском языке.";
+        case TMI_DESCRIPTION: return L"Отображает внешний IP, цветной флаг страны, город и провайдера на русском языке. Мигает 10 сек при смене сети.";
         case TMI_AUTHOR:      return L"Custom RU Plugin";
         case TMI_COPYRIGHT:   return L"MIT";
-        case TMI_VERSION:     return L"1.1.0";
+        case TMI_VERSION:     return L"1.2.0";
         case TMI_URL:         return L"https://github.com/zhongyang219/TrafficMonitorPlugins";
         default:              return L"";
         }
@@ -317,7 +334,11 @@ public:
         std::lock_guard<std::mutex> lock(m_dataMutex);
         if (!m_data.valid)
         {
-            m_tooltip = L"IP-адрес: " + m_data.ip + L"\nОжидание ответа от сервиса геолокации...";
+            m_tooltip = L"Статус: " + m_data.ip;
+            if (!m_data.updatedAt.empty())
+                m_tooltip += L"\nПоследняя проверка: " + m_data.updatedAt;
+            else
+                m_tooltip += L"\nОжидание ответа от сервиса геолокации...";
             return m_tooltip.c_str();
         }
 
@@ -355,6 +376,23 @@ public:
     void OnInitialize(ITrafficMonitor* pApp) override
     {
         m_pApp = pApp;
+        RecordUiThread();
+    }
+
+    void RecordUiThread()
+    {
+        if (m_uiThreadId.load() == 0)
+            m_uiThreadId.store(GetCurrentThreadId());
+    }
+
+    bool IsBlinkHidden() const
+    {
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG until = m_blinkUntilMs.load();
+        if (now >= until)
+            return false;
+        ULONGLONG elapsed = now - m_blinkStartMs.load();
+        return ((elapsed / 375) % 2) == 1;
     }
 
     IpGeoData GetDataSnapshot() const
@@ -438,9 +476,49 @@ private:
         : m_itemIp(*this, CIpDisplayItem::Mode::FlagAndIp),
           m_itemLoc(*this, CIpDisplayItem::Mode::FlagAndLocation),
           m_itemCodeIp(*this, CIpDisplayItem::Mode::FlagCodeAndIp),
-          m_itemMini(*this, CIpDisplayItem::Mode::FlagAboveCode)
+          m_itemMini(*this, CIpDisplayItem::Mode::FlagAboveCode),
+          m_itemTwoLine(*this, CIpDisplayItem::Mode::TwoLineFlagIpIsp)
     {
         m_data.ip = L"Загрузка...";
+    }
+
+    void StartBlink(ULONGLONG durationMs)
+    {
+        ULONGLONG now = GetTickCount64();
+        m_blinkStartMs.store(now);
+        m_blinkUntilMs.store(now + durationMs);
+
+        std::lock_guard<std::mutex> lock(m_blinkMutex);
+        if (!m_blinkThreadRunning.load())
+        {
+            if (m_blinkThread.joinable())
+                m_blinkThread.join();
+            m_blinkThreadRunning.store(true);
+            m_blinkThread = std::thread([this]() { BlinkLoop(); });
+        }
+    }
+
+    void BlinkLoop()
+    {
+        while (!m_stopping.load())
+        {
+            if (GetTickCount64() < m_blinkUntilMs.load())
+            {
+                InvalidateThreadWindows(m_uiThreadId.load());
+                Sleep(375);
+                continue;
+            }
+
+            std::lock_guard<std::mutex> lock(m_blinkMutex);
+            if (GetTickCount64() >= m_blinkUntilMs.load())
+            {
+                m_blinkThreadRunning.store(false);
+                break;
+            }
+        }
+
+        if (!m_stopping.load())
+            InvalidateThreadWindows(m_uiThreadId.load());
     }
 
     void FetchThread()
@@ -448,8 +526,13 @@ private:
         struct ScopeExit
         {
             std::atomic<bool>& flag;
-            ~ScopeExit() { flag = false; }
-        } guard{ m_fetching };
+            ULONGLONG& lastMs;
+            ~ScopeExit()
+            {
+                lastMs = GetTickCount64();
+                flag = false;
+            }
+        } guard{ m_fetching, m_lastFetchMs };
 
         if (m_stopping)
             return;
@@ -496,27 +579,34 @@ private:
             }
         }
 
-        if (!next.valid)
-        {
-            std::lock_guard<std::mutex> lock(m_dataMutex);
-            if (!m_data.valid)
-                m_data.ip = L"Ошибка сети";
-            return;
-        }
-
         next.updatedAt = FormatCurrentTime();
 
+        if (!next.valid)
+        {
+            next.ip = L"Нет сети";
+            next.country = L"Нет сети";
+            next.countryCode.clear();
+            next.isp.clear();
+            next.org.clear();
+        }
+
+        bool prevValid = false;
+        std::wstring prevIp;
         std::wstring prevCode;
+        std::wstring prevIsp;
         std::vector<uint8_t> prevPng;
         uint64_t prevGen = 0;
         {
             std::lock_guard<std::mutex> lock(m_dataMutex);
+            prevValid = m_data.valid;
+            prevIp = m_data.ip;
             prevCode = m_data.countryCode;
+            prevIsp = m_data.isp;
             prevPng = m_data.flagPng;
             prevGen = m_data.flagGeneration;
         }
 
-        if (!next.countryCode.empty())
+        if (next.valid && !next.countryCode.empty())
         {
             if (next.countryCode == prevCode && !prevPng.empty())
             {
@@ -538,9 +628,33 @@ private:
             }
         }
 
+        bool hadFirstResult = m_hasFirstResult.exchange(true);
+        bool changed = false;
+        if (!hadFirstResult)
+        {
+            // При самом первом запуске мигаем, только если сети нет сразу
+            changed = !next.valid;
+        }
+        else
+        {
+            changed = (prevValid != next.valid) ||
+                      (prevIp != next.ip) ||
+                      (prevCode != next.countryCode) ||
+                      (prevIsp != next.isp);
+        }
+
         {
             std::lock_guard<std::mutex> lock(m_dataMutex);
             m_data = std::move(next);
+        }
+
+        if (changed && !m_stopping)
+        {
+            StartBlink(10000);
+        }
+        else if (!m_stopping)
+        {
+            InvalidateThreadWindows(m_uiThreadId.load());
         }
     }
 
@@ -548,6 +662,7 @@ private:
     CIpDisplayItem m_itemLoc;
     CIpDisplayItem m_itemCodeIp;
     CIpDisplayItem m_itemMini;
+    CIpDisplayItem m_itemTwoLine;
 
     mutable std::mutex m_dataMutex;
     IpGeoData m_data;
@@ -555,8 +670,16 @@ private:
 
     std::atomic<bool> m_fetching{ false };
     std::atomic<bool> m_stopping{ false };
+    std::atomic<bool> m_hasFirstResult{ false };
     ULONGLONG m_lastFetchMs = 0;
     std::thread m_worker;
+
+    std::atomic<DWORD> m_uiThreadId{ 0 };
+    std::atomic<ULONGLONG> m_blinkStartMs{ 0 };
+    std::atomic<ULONGLONG> m_blinkUntilMs{ 0 };
+    std::mutex m_blinkMutex;
+    std::atomic<bool> m_blinkThreadRunning{ false };
+    std::thread m_blinkThread;
 
     ITrafficMonitor* m_pApp = nullptr;
     COLORREF m_textColor = RGB(255, 255, 255);
@@ -574,11 +697,12 @@ const wchar_t* CIpDisplayItem::GetItemName() const
 {
     switch (m_mode)
     {
-    case Mode::FlagAndIp:       return L"Флаг + IP-адрес";
-    case Mode::FlagAndLocation: return L"Флаг + Страна/Город";
-    case Mode::FlagCodeAndIp:   return L"Флаг + Код + IP";
-    case Mode::FlagAboveCode:   return L"Флаг + Код снизу (мини)";
-    default:                    return L"IP";
+    case Mode::FlagAndIp:        return L"Флаг + IP-адрес";
+    case Mode::FlagAndLocation:  return L"Флаг + Страна/Город";
+    case Mode::FlagCodeAndIp:    return L"Флаг + Код + IP";
+    case Mode::FlagAboveCode:    return L"Флаг + Код снизу (мини)";
+    case Mode::TwoLineFlagIpIsp: return L"Флаг + IP / Провайдер (2 строки)";
+    default:                     return L"IP";
     }
 }
 
@@ -586,12 +710,26 @@ const wchar_t* CIpDisplayItem::GetItemId() const
 {
     switch (m_mode)
     {
-    case Mode::FlagAndIp:       return L"ip_loc_ru_flag_ip";
-    case Mode::FlagAndLocation: return L"ip_loc_ru_flag_loc";
-    case Mode::FlagCodeAndIp:   return L"ip_loc_ru_flag_code_ip";
-    case Mode::FlagAboveCode:   return L"ip_loc_ru_flag_code_mini";
-    default:                    return L"ip_loc_ru_default";
+    case Mode::FlagAndIp:        return L"ip_loc_ru_flag_ip";
+    case Mode::FlagAndLocation:  return L"ip_loc_ru_flag_loc";
+    case Mode::FlagCodeAndIp:    return L"ip_loc_ru_flag_code_ip";
+    case Mode::FlagAboveCode:    return L"ip_loc_ru_flag_code_mini";
+    case Mode::TwoLineFlagIpIsp: return L"ip_loc_ru_2line_ip_isp";
+    default:                     return L"ip_loc_ru_default";
     }
+}
+
+std::wstring CIpDisplayItem::BuildProviderLine(const IpGeoData& d) const
+{
+    if (!d.valid)
+        return (d.ip == L"Загрузка...") ? L"Подключение..." : L"Нет подключения";
+    if (!d.isp.empty())
+        return d.isp;
+    if (!d.org.empty())
+        return d.org;
+    if (!d.country.empty())
+        return d.country;
+    return L"—";
 }
 
 std::wstring CIpDisplayItem::BuildDisplayText() const
@@ -613,8 +751,10 @@ std::wstring CIpDisplayItem::BuildDisplayText() const
         return d.countryCode + L" • " + d.ip;
     case Mode::FlagAboveCode:
         if (!d.valid)
-            return (d.ip == L"Ошибка сети") ? L"--" : L"...";
+            return (d.ip == L"Загрузка...") ? L"..." : L"--";
         return !d.countryCode.empty() ? d.countryCode : L"--";
+    case Mode::TwoLineFlagIpIsp:
+        return d.ip + L" / " + BuildProviderLine(d);
     default:
         return d.ip;
     }
@@ -630,17 +770,22 @@ const wchar_t* CIpDisplayItem::GetItemValueSampleText() const
 {
     switch (m_mode)
     {
-    case Mode::FlagAndIp:       return L"255.255.255.255";
-    case Mode::FlagAndLocation: return L"Нидерланды, Амстердам";
-    case Mode::FlagCodeAndIp:   return L"NL • 255.255.255.255";
-    case Mode::FlagAboveCode:   return L"DE";
-    default:                    return L"255.255.255.255";
+    case Mode::FlagAndIp:        return L"255.255.255.255";
+    case Mode::FlagAndLocation:  return L"Нидерланды, Амстердам";
+    case Mode::FlagCodeAndIp:    return L"NL • 255.255.255.255";
+    case Mode::FlagAboveCode:    return L"DE";
+    case Mode::TwoLineFlagIpIsp: return L"255.255.255.255";
+    default:                     return L"255.255.255.255";
     }
 }
 
 int CIpDisplayItem::GetItemWidth() const
 {
-    return (m_mode == Mode::FlagAboveCode) ? 32 : 140;
+    if (m_mode == Mode::FlagAboveCode)
+        return 32;
+    if (m_mode == Mode::TwoLineFlagIpIsp)
+        return 145;
+    return 140;
 }
 
 int CIpDisplayItem::GetItemWidthEx(void* hDC) const
@@ -650,13 +795,12 @@ int CIpDisplayItem::GetItemWidthEx(void* hDC) const
         return GetItemWidth();
 
     IpGeoData d = m_owner.GetDataSnapshot();
-    std::wstring text = BuildDisplayText();
-
     int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
     if (dpiY <= 0) dpiY = 96;
 
     if (m_mode == Mode::FlagAboveCode)
     {
+        std::wstring text = BuildDisplayText();
         int flagH = MulDiv(12, dpiY, 96);
         int flagW = (flagH * 3) / 2;
 
@@ -676,6 +820,38 @@ int CIpDisplayItem::GetItemWidthEx(void* hDC) const
         return std::max(flagW, textW) + MulDiv(6, dpiY, 96);
     }
 
+    if (m_mode == Mode::TwoLineFlagIpIsp)
+    {
+        std::wstring topText = d.ip;
+        std::wstring botText = BuildProviderLine(d);
+
+        HFONT lineFont = CreateCompactFont(hdc, MulDiv(12, dpiY, 96));
+        HFONT oldFont = lineFont ? static_cast<HFONT>(SelectObject(hdc, lineFont)) : nullptr;
+
+        RECT rcTop{ 0, 0, 0, 0 };
+        DrawTextW(hdc, topText.c_str(), -1, &rcTop, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        int topW = rcTop.right - rcTop.left;
+
+        RECT rcBot{ 0, 0, 0, 0 };
+        DrawTextW(hdc, botText.c_str(), -1, &rcBot, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        int botW = rcBot.right - rcBot.left;
+
+        if (lineFont)
+        {
+            SelectObject(hdc, oldFont);
+            DeleteObject(lineFont);
+        }
+
+        int flagH = MulDiv(11, dpiY, 96);
+        int flagW = (flagH * 3) / 2;
+        int gap = MulDiv(4, dpiY, 96);
+        int topTotalW = (d.flagPng.empty() ? 0 : (flagW + gap)) + topW;
+        int maxAllowedW = MulDiv(170, dpiY, 96);
+
+        return std::min(maxAllowedW, std::max(topTotalW, botW) + MulDiv(6, dpiY, 96));
+    }
+
+    std::wstring text = BuildDisplayText();
     RECT rc{ 0, 0, 0, 0 };
     DrawTextW(hdc, text.c_str(), -1, &rc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
     int textW = rc.right - rc.left;
@@ -690,23 +866,28 @@ int CIpDisplayItem::GetItemWidthEx(void* hDC) const
 
 void CIpDisplayItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_mode)
 {
+    m_owner.RecordUiThread();
+    if (m_owner.IsBlinkHidden())
+        return;
+
     HDC hdc = static_cast<HDC>(hDC);
     if (!hdc)
         return;
 
     IpGeoData d = m_owner.GetDataSnapshot();
-    std::wstring text = BuildDisplayText();
-
     int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
     if (dpiY <= 0) dpiY = 96;
 
     int oldBk = SetBkMode(hdc, TRANSPARENT);
     COLORREF targetColor = dark_mode ? RGB(255, 255, 255) : RGB(0, 0, 0);
     m_owner.TryGetTextColor(targetColor);
+    if (!d.valid && d.ip == L"Нет сети")
+        targetColor = dark_mode ? RGB(255, 95, 95) : RGB(210, 35, 35);
     COLORREF oldColor = SetTextColor(hdc, targetColor);
 
     if (m_mode == Mode::FlagAboveCode)
     {
+        std::wstring text = BuildDisplayText();
         bool hasFlag = !d.flagPng.empty();
         int fontPx = std::min(std::max(8, h * 34 / 100), MulDiv(10, dpiY, 96));
         HFONT compactFont = CreateCompactFont(hdc, fontPx);
@@ -743,8 +924,44 @@ void CIpDisplayItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_m
             DeleteObject(compactFont);
         }
     }
+    else if (m_mode == Mode::TwoLineFlagIpIsp)
+    {
+        std::wstring topText = d.ip;
+        std::wstring botText = BuildProviderLine(d);
+
+        int topH = h / 2;
+        int maxLineFontPx = std::max(8, topH - 2);
+        int fontPx = std::min(MulDiv(12, dpiY, 96), maxLineFontPx);
+        HFONT lineFont = CreateCompactFont(hdc, fontPx);
+        HFONT oldFont = lineFont ? static_cast<HFONT>(SelectObject(hdc, lineFont)) : nullptr;
+
+        int flagH = std::min(std::max(7, topH - 3), MulDiv(11, dpiY, 96));
+        int flagW = (flagH * 3) / 2;
+        int gap = MulDiv(4, dpiY, 96);
+        int topX = x + 1;
+
+        if (!d.flagPng.empty())
+        {
+            int flagY = y + std::max(0, (topH - flagH) / 2);
+            m_owner.EnsureGdiplusAndDrawFlag(hdc, topX, flagY, flagW, flagH, d.flagPng, d.flagGeneration);
+            topX += flagW + gap;
+        }
+
+        RECT topRc{ topX, y, x + w, y + topH };
+        DrawTextW(hdc, topText.c_str(), -1, &topRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        RECT botRc{ x + 1, y + topH, x + w, y + h };
+        DrawTextW(hdc, botText.c_str(), -1, &botRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+        if (lineFont)
+        {
+            SelectObject(hdc, oldFont);
+            DeleteObject(lineFont);
+        }
+    }
     else
     {
+        std::wstring text = BuildDisplayText();
         int flagH = std::min(std::max(8, h - 4), MulDiv(12, dpiY, 96));
         int flagW = (flagH * 3) / 2;
         int gap = MulDiv(4, dpiY, 96);
