@@ -132,7 +132,7 @@ namespace
             return false;
         }
 
-        DWORD flags = useHttps ? WINHTTP_FLAG_SECURE : 0;
+        DWORD flags = (useHttps ? WINHTTP_FLAG_SECURE : 0) | WINHTTP_FLAG_REFRESH;
         HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path, nullptr,
                                                 WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
         if (!hRequest)
@@ -306,12 +306,13 @@ public:
     {
         RecordUiThread();
         ULONGLONG now = GetTickCount64();
-        if (!m_fetching.load() && (m_lastFetchMs == 0 || now - m_lastFetchMs >= 6000))
+        ULONGLONG last = m_lastFetchMs.load();
+        if (!m_fetching.load() && (last == 0 || now - last >= 6000))
         {
             if (m_worker.joinable())
                 m_worker.join();
             m_fetching = true;
-            m_lastFetchMs = now;
+            m_lastFetchMs.store(now);
             m_worker = std::thread([this]() { FetchThread(); });
         }
     }
@@ -324,7 +325,7 @@ public:
         case TMI_DESCRIPTION: return L"Отображает внешний IP, цветной флаг страны, город и провайдера на русском языке. Мигает 10 сек при смене сети.";
         case TMI_AUTHOR:      return L"Custom RU Plugin";
         case TMI_COPYRIGHT:   return L"MIT";
-        case TMI_VERSION:     return L"1.3.1";
+        case TMI_VERSION:     return L"1.3.2";
         case TMI_URL:         return L"https://github.com/zhongyang219/TrafficMonitorPlugins";
         default:              return L"";
         }
@@ -417,7 +418,7 @@ public:
 
     void EnsureGdiplusAndDrawFlag(HDC hdc, int x, int y, int w, int h, const std::vector<uint8_t>& pngBytes, uint64_t generation)
     {
-        if (pngBytes.empty())
+        if (pngBytes.empty() || generation == 0)
             return;
 
         std::call_once(m_gdipOnce, [this]() {
@@ -532,11 +533,11 @@ private:
         struct ScopeExit
         {
             std::atomic<bool>& flag;
-            ULONGLONG& lastMs;
+            std::atomic<ULONGLONG>& lastMs;
             ~ScopeExit()
             {
-                lastMs = GetTickCount64();
-                flag = false;
+                lastMs.store(GetTickCount64());
+                flag.store(false);
             }
         } guard{ m_fetching, m_lastFetchMs };
 
@@ -572,7 +573,7 @@ private:
         {
             std::string json(body.begin(), body.end());
             std::string ip = ExtractJsonString(json, "ip");
-            if (!ip.empty())
+            if (!ip.empty() && json.find("\"success\":false") == std::string::npos)
             {
                 next.valid = true;
                 next.ip = Utf8ToWide(ip);
@@ -614,7 +615,7 @@ private:
 
         if (next.valid && !next.countryCode.empty())
         {
-            if (next.countryCode == prevCode && !prevPng.empty())
+            if (next.countryCode == prevCode && !prevPng.empty() && prevGen != 0)
             {
                 next.flagPng = std::move(prevPng);
                 next.flagGeneration = prevGen;
@@ -629,7 +630,7 @@ private:
                 if (HttpGet(L"flagcdn.com", INTERNET_DEFAULT_HTTPS_PORT, flagPath.c_str(), true, png))
                 {
                     next.flagPng = std::move(png);
-                    next.flagGeneration = prevGen + 1;
+                    next.flagGeneration = ++m_nextFlagGeneration;
                 }
             }
         }
@@ -676,7 +677,8 @@ private:
     std::atomic<bool> m_fetching{ false };
     std::atomic<bool> m_stopping{ false };
     std::atomic<bool> m_hasFirstResult{ false };
-    ULONGLONG m_lastFetchMs = 0;
+    std::atomic<ULONGLONG> m_lastFetchMs{ 0 };
+    std::atomic<uint64_t> m_nextFlagGeneration{ 0 };
     std::thread m_worker;
 
     std::atomic<DWORD> m_uiThreadId{ 0 };
@@ -984,8 +986,6 @@ void CIpDisplayItem::DrawItem(void* hDC, int x, int y, int w, int h, bool dark_m
     else
     {
         std::wstring text = BuildDisplayText();
-        int textW = MeasureTextWidth(hdc, text);
-        (void)textW;
 
         int flagH = std::min(std::max(8, h - 4), MulDiv(12, dpiY, 96));
         int flagW = (flagH * 3) / 2;
